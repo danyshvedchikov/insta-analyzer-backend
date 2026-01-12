@@ -47,7 +47,7 @@ def analyze_instagram_profile(request: AnalyzeRequest):
                     "content": prompt_text,
                 }
             ],
-            model="gpt-4-turbo", # или другая доступная модель
+            model="gpt-4o-mini", # или другая доступная модель
         )
 
         # Получаем и возвращаем результат
@@ -58,3 +58,4 @@ def analyze_instagram_profile(request: AnalyzeRequest):
         # Если что-то пошло не так, возвращаем ошибку
         print(f"Error during analysis: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
