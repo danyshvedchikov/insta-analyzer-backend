@@ -13,9 +13,6 @@ from openai import OpenAI
 client = OpenAI() 
 # Эта команда автоматически ищет переменную с именем OPENAI_API_KEY
 
-client = OpenAI(api_key=API_KEY)
-
-
 app = FastAPI()
 
 # --- Настройка CORS ---
@@ -91,3 +88,4 @@ async def analyze_post(post_data: PostData):
 def read_root():
 
     return {"message": "Сервер InstaAnalyzer запущен и готов к работе!"}
+
