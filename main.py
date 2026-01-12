@@ -7,7 +7,11 @@ from openai import OpenAI
 # --- КОНФИГУРАЦИЯ ---
 # Вставляем API ключ прямо в код для надежности
 
-API_KEY = "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"
+# --- КОНФИГУРАЦИЯ ---
+# Ключ будет автоматически взят из переменных окружения на сервере Vercel
+
+client = OpenAI() 
+# Эта команда автоматически ищет переменную с именем OPENAI_API_KEY
 
 client = OpenAI(api_key=API_KEY)
 
@@ -85,4 +89,5 @@ async def analyze_post(post_data: PostData):
 # --- Главная страница для проверки работы сервера ---
 @app.get("/")
 def read_root():
+
     return {"message": "Сервер InstaAnalyzer запущен и готов к работе!"}
