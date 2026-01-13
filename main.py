@@ -5,7 +5,6 @@ from openai import OpenAI
 import requests
 import os
 import base64
-import traceback
 from typing import Optional
 
 app = FastAPI()
@@ -98,6 +97,90 @@ def get_image_bytes(photo_url: Optional[str], image_base64: Optional[str]) -> by
         raise ValueError("Either photo_url or image_base64 must be provided")
 
 
+def analyze_with_gpt4_vision(photo_url: Optional[str], image_base64: Optional[str]) -> dict:
+    """Analyze photo using GPT-4 Vision for filter and manipulation detection"""
+    result = {
+        "has_filters": None,
+        "filter_type": None,
+        "manipulation_signs": None,
+        "authenticity_score": None,
+        "analysis": None,
+        "error": None
+    }
+    
+    try:
+        # Prepare image for GPT-4 Vision
+        if image_base64:
+            # Ensure proper base64 format
+            if ',' in image_base64:
+                image_data = image_base64
+            else:
+                image_data = f"data:image/jpeg;base64,{image_base64}"
+        else:
+            image_data = photo_url
+        
+        prompt = """Проанализируй это фото и определи:
+
+1. ФИЛЬТРЫ И МАСКИ:
+- Есть ли на фото фильтры Snapchat, Instagram, TikTok или других приложений?
+- Какой тип фильтра (маска на лицо, эффекты, украшения, изменение внешности)?
+- Насколько сильно фильтр изменяет внешность (слабо/средне/сильно)?
+
+2. ОБРАБОТКА ФОТО:
+- Есть ли признаки ретуши или фотошопа?
+- Есть ли бьюти-фильтры (сглаживание кожи, увеличение глаз, изменение формы лица)?
+- Есть ли признаки AI-генерации (неестественные детали, артефакты)?
+
+3. ОЦЕНКА ПОДЛИННОСТИ:
+- Дай оценку от 0 до 100%, где 100% = полностью натуральное фото без обработки
+
+Ответь в формате:
+ФИЛЬТРЫ: [Да/Нет] - [тип фильтра если есть]
+ОБРАБОТКА: [описание]
+ПОДЛИННОСТЬ: [число]%
+ВЫВОД: [краткий вывод]"""
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": image_data}
+                        }
+                    ]
+                }
+            ],
+            max_tokens=500
+        )
+        
+        analysis_text = response.choices[0].message.content
+        result["analysis"] = analysis_text
+        
+        # Parse the response
+        lines = analysis_text.upper()
+        
+        # Check for filters
+        if "ФИЛЬТРЫ: ДА" in lines or "ФИЛЬТРЫ:ДА" in lines:
+            result["has_filters"] = True
+        elif "ФИЛЬТРЫ: НЕТ" in lines or "ФИЛЬТРЫ:НЕТ" in lines:
+            result["has_filters"] = False
+        
+        # Try to extract authenticity score
+        import re
+        match = re.search(r'ПОДЛИННОСТЬ[:\s]*(\d+)', lines)
+        if match:
+            result["authenticity_score"] = int(match.group(1))
+            
+    except Exception as e:
+        result["error"] = f"GPT-4 Vision error: {str(e)}"
+    
+    return result
+
+
 def analyze_with_sightengine(photo_url: Optional[str], image_base64: Optional[str]) -> dict:
     """Analyze photo using Sightengine API"""
     result = {
@@ -169,6 +252,7 @@ def analyze_with_sightengine(photo_url: Optional[str], image_base64: Optional[st
                     result["face_quality"] = attrs.get("quality", "unknown")
                     result["face_obstruction"] = attrs.get("obstruction", "unknown")
                     result["face_angle"] = attrs.get("angle", "unknown")
+                    # IMPORTANT: filters is a boolean
                     result["face_filters"] = attrs.get("filters", None)
                 
                 # Check for sunglasses
@@ -190,6 +274,7 @@ def analyze_with_hive(photo_url: Optional[str], image_base64: Optional[str]) -> 
     result = {
         "ai_generated": None,
         "ai_source": None,
+        "deepfake": None,
         "error": None
     }
     
@@ -213,14 +298,13 @@ def analyze_with_hive(photo_url: Optional[str], image_base64: Optional[str]) -> 
                 timeout=30
             )
         else:
-            # Use URL
-            headers["Content-Type"] = "application/json"
+            # Use URL - IMPORTANT: use data= not json=
             payload = {"url": photo_url}
             
             response = requests.post(
                 "https://api.thehive.ai/api/v2/task/sync",
                 headers=headers,
-                json=payload,
+                data=payload,  # Changed from json= to data=
                 timeout=30
             )
         
@@ -231,6 +315,13 @@ def analyze_with_hive(photo_url: Optional[str], image_base64: Optional[str]) -> 
         if "status" in data and isinstance(data["status"], list) and len(data["status"]) > 0:
             status_item = data["status"][0]
             
+            # Check for error in status
+            if "status" in status_item:
+                inner_status = status_item["status"]
+                if inner_status.get("code") != "0":
+                    result["error"] = inner_status.get("message", "Unknown Hive error")
+                    return result
+            
             if "response" in status_item and "output" in status_item["response"]:
                 output = status_item["response"]["output"]
                 
@@ -240,6 +331,7 @@ def analyze_with_hive(photo_url: Optional[str], image_base64: Optional[str]) -> 
                     ai_generated_score = None
                     best_source = None
                     best_source_score = 0
+                    deepfake_score = None
                     
                     # List of known AI generators
                     ai_generators = [
@@ -265,6 +357,10 @@ def analyze_with_hive(photo_url: Optional[str], image_base64: Optional[str]) -> 
                         if class_name == "ai_generated":
                             ai_generated_score = score
                         
+                        # Get deepfake score
+                        if class_name == "deepfake":
+                            deepfake_score = score
+                        
                         # Find the best matching AI source
                         if class_name in ai_generators and score > best_source_score:
                             best_source = class_name
@@ -273,20 +369,11 @@ def analyze_with_hive(photo_url: Optional[str], image_base64: Optional[str]) -> 
                     if ai_generated_score is not None:
                         result["ai_generated"] = round(ai_generated_score * 100, 1)
                     
+                    if deepfake_score is not None:
+                        result["deepfake"] = round(deepfake_score * 100, 1)
+                    
                     if best_source and best_source_score > 0.1:
                         result["ai_source"] = f"{best_source} ({round(best_source_score * 100, 1)}%)"
-        
-        # Alternative response structure (direct status without array)
-        elif "status" in data and isinstance(data["status"], dict):
-            if data["status"].get("code") == "0" or data["status"].get("message") == "SUCCESS":
-                if "response" in data and "output" in data["response"]:
-                    output = data["response"]["output"]
-                    if len(output) > 0 and "classes" in output[0]:
-                        classes = output[0]["classes"]
-                        for cls in classes:
-                            if cls.get("class") == "ai_generated":
-                                result["ai_generated"] = round(cls.get("score", 0) * 100, 1)
-                                break
                                 
     except requests.exceptions.Timeout:
         result["error"] = "Hive API timeout"
@@ -296,25 +383,47 @@ def analyze_with_hive(photo_url: Optional[str], image_base64: Optional[str]) -> 
     return result
 
 
-def format_analysis_result(sightengine_result: dict, hive_result: dict) -> str:
+def format_analysis_result(sightengine_result: dict, hive_result: dict, gpt_result: dict) -> str:
     """Format the analysis results in Russian with emoji"""
     lines = []
     
     lines.append("📸 **АНАЛИЗ ФОТОГРАФИИ**")
     lines.append("")
     
+    # Filter Detection Section (MOST IMPORTANT)
+    lines.append("🎭 **Фильтры и маски:**")
+    
+    # GPT-4 Vision filter detection
+    if gpt_result.get("has_filters") is True:
+        lines.append(f"  • GPT-4 Vision: ✅ Обнаружены фильтры")
+    elif gpt_result.get("has_filters") is False:
+        lines.append(f"  • GPT-4 Vision: ❌ Фильтры не обнаружены")
+    else:
+        lines.append(f"  • GPT-4 Vision: Данные недоступны")
+    
+    # Sightengine filter detection
+    if sightengine_result.get("face_filters") is True:
+        lines.append(f"  • Sightengine: ✅ Обнаружены фильтры на лице")
+    elif sightengine_result.get("face_filters") is False:
+        lines.append(f"  • Sightengine: ❌ Фильтры не обнаружены")
+    else:
+        if sightengine_result.get("face_detected"):
+            lines.append(f"  • Sightengine: Данные о фильтрах недоступны")
+    
+    lines.append("")
+    
     # AI Generation Detection Section
-    lines.append("🤖 **Обнаружение ИИ-генерации:**")
+    lines.append("🤖 **ИИ-генерация (полностью созданные ИИ):**")
     
     # Sightengine AI detection
     if sightengine_result.get("ai_generated") is not None:
         ai_score = sightengine_result["ai_generated"]
         if ai_score < 20:
-            verdict = "✅ Вероятно реальное фото"
+            verdict = "✅ Реальное фото"
         elif ai_score < 50:
-            verdict = "⚠️ Возможно отредактировано"
+            verdict = "⚠️ Возможна обработка"
         else:
-            verdict = "🚨 Вероятно ИИ-генерация"
+            verdict = "🚨 Вероятно ИИ"
         lines.append(f"  • Sightengine: {ai_score}% {verdict}")
     else:
         lines.append(f"  • Sightengine: Данные недоступны")
@@ -323,25 +432,36 @@ def format_analysis_result(sightengine_result: dict, hive_result: dict) -> str:
     if hive_result.get("ai_generated") is not None:
         ai_score = hive_result["ai_generated"]
         if ai_score < 20:
-            verdict = "✅ Вероятно реальное фото"
+            verdict = "✅ Реальное фото"
         elif ai_score < 50:
-            verdict = "⚠️ Возможно отредактировано"
+            verdict = "⚠️ Возможна обработка"
         else:
-            verdict = "🚨 Вероятно ИИ-генерация"
+            verdict = "🚨 Вероятно ИИ"
         lines.append(f"  • Hive AI: {ai_score}% {verdict}")
         
         if hive_result.get("ai_source"):
-            lines.append(f"  • Возможный источник: {hive_result['ai_source']}")
+            lines.append(f"    Источник: {hive_result['ai_source']}")
     else:
         if hive_result.get("error"):
-            lines.append(f"  • Hive AI: Ошибка - {hive_result['error'][:100]}")
+            lines.append(f"  • Hive AI: ⚠️ {hive_result['error'][:80]}")
         else:
             lines.append(f"  • Hive AI: Данные недоступны")
+    
+    # Deepfake detection
+    if hive_result.get("deepfake") is not None:
+        df_score = hive_result["deepfake"]
+        if df_score < 20:
+            verdict = "✅ Не дипфейк"
+        elif df_score < 50:
+            verdict = "⚠️ Возможен дипфейк"
+        else:
+            verdict = "🚨 Вероятно дипфейк"
+        lines.append(f"  • Дипфейк: {df_score}% {verdict}")
     
     lines.append("")
     
     # Quality Section
-    lines.append("📊 **Качество изображения:**")
+    lines.append("📊 **Качество:**")
     if sightengine_result.get("quality_score") is not None:
         quality = sightengine_result["quality_score"]
         if quality >= 85:
@@ -352,69 +472,54 @@ def format_analysis_result(sightengine_result: dict, hive_result: dict) -> str:
             quality_text = "Среднее"
         else:
             quality_text = "Низкое"
-        lines.append(f"  • Оценка качества: {quality}/100 ({quality_text})")
-    else:
-        lines.append(f"  • Оценка качества: Данные недоступны")
+        lines.append(f"  • Качество: {quality}/100 ({quality_text})")
     
     lines.append("")
     
     # Face Analysis Section
     lines.append("👤 **Анализ лица:**")
     if sightengine_result.get("face_detected"):
-        lines.append(f"  • Лицо обнаружено: ✅ Да")
+        lines.append(f"  • Лицо: ✅ Обнаружено")
         
-        # Face quality
         face_quality = sightengine_result.get("face_quality")
         if face_quality:
-            quality_map = {
-                "perfect": "Идеальное",
-                "high": "Высокое",
-                "medium": "Среднее",
-                "low": "Низкое"
-            }
+            quality_map = {"perfect": "Идеальное", "high": "Высокое", "medium": "Среднее", "low": "Низкое"}
             lines.append(f"  • Качество лица: {quality_map.get(face_quality, face_quality)}")
         
-        # Face obstruction
         face_obstruction = sightengine_result.get("face_obstruction")
         if face_obstruction:
-            obstruction_map = {
-                "none": "Нет препятствий",
-                "light": "Легкое",
-                "medium": "Среднее",
-                "heavy": "Сильное",
-                "extreme": "Экстремальное",
-                "complete": "Полное"
-            }
+            obstruction_map = {"none": "Нет", "light": "Легкое", "medium": "Среднее", "heavy": "Сильное", "extreme": "Экстремальное", "complete": "Полное"}
             lines.append(f"  • Препятствия: {obstruction_map.get(face_obstruction, face_obstruction)}")
         
-        # Face angle
-        face_angle = sightengine_result.get("face_angle")
-        if face_angle:
-            angle_map = {
-                "straight": "Прямой",
-                "side": "Боковой",
-                "back": "Сзади"
-            }
-            lines.append(f"  • Угол лица: {angle_map.get(face_angle, face_angle)}")
-        
-        # Filters
-        face_filters = sightengine_result.get("face_filters")
-        if face_filters is not None:
-            lines.append(f"  • Фильтры на лице: {'Да' if face_filters else 'Нет'}")
-        
-        # Sunglasses
         sunglasses = sightengine_result.get("sunglasses")
         if sunglasses is not None:
-            lines.append(f"  • Солнечные очки: {'Да' if sunglasses else 'Нет'}")
+            lines.append(f"  • Очки: {'Да' if sunglasses else 'Нет'}")
     else:
-        lines.append(f"  • Лицо обнаружено: ❌ Нет")
+        lines.append(f"  • Лицо: ❌ Не обнаружено")
+    
+    lines.append("")
+    
+    # GPT-4 Vision detailed analysis
+    if gpt_result.get("analysis"):
+        lines.append("🔍 **Детальный анализ (GPT-4 Vision):**")
+        # Add the analysis with proper indentation
+        for line in gpt_result["analysis"].split('\n'):
+            if line.strip():
+                lines.append(f"  {line}")
     
     lines.append("")
     
     # Overall verdict
-    lines.append("📋 **Итоговая оценка:**")
+    lines.append("📋 **ИТОГ:**")
     
     # Calculate overall authenticity
+    authenticity_scores = []
+    
+    # From GPT-4 Vision
+    if gpt_result.get("authenticity_score") is not None:
+        authenticity_scores.append(gpt_result["authenticity_score"])
+    
+    # From AI detection (inverse)
     ai_scores = []
     if sightengine_result.get("ai_generated") is not None:
         ai_scores.append(sightengine_result["ai_generated"])
@@ -423,39 +528,40 @@ def format_analysis_result(sightengine_result: dict, hive_result: dict) -> str:
     
     if ai_scores:
         avg_ai = sum(ai_scores) / len(ai_scores)
-        authenticity = 100 - avg_ai
+        authenticity_scores.append(100 - avg_ai)
+    
+    # Determine filter penalty
+    filter_penalty = 0
+    if gpt_result.get("has_filters") is True:
+        filter_penalty = 30
+    elif sightengine_result.get("face_filters") is True:
+        filter_penalty = 25
+    
+    if authenticity_scores:
+        avg_authenticity = sum(authenticity_scores) / len(authenticity_scores)
+        final_score = max(0, avg_authenticity - filter_penalty)
         
-        if authenticity >= 80:
+        if final_score >= 80:
             verdict = "✅ Фото выглядит подлинным"
-        elif authenticity >= 50:
-            verdict = "⚠️ Фото может быть отредактировано"
+        elif final_score >= 50:
+            verdict = "⚠️ Фото обработано или с фильтрами"
         else:
-            verdict = "🚨 Высокая вероятность ИИ-генерации"
+            verdict = "🚨 Сильная обработка или ИИ-генерация"
         
-        lines.append(f"  • Подлинность: {round(authenticity, 1)}%")
+        lines.append(f"  • Подлинность: {round(final_score, 1)}%")
         lines.append(f"  • Вердикт: {verdict}")
+        
+        if filter_penalty > 0:
+            lines.append(f"  • Примечание: Обнаружены фильтры (-{filter_penalty}%)")
     else:
         lines.append(f"  • Недостаточно данных для оценки")
-    
-    # Add errors if any
-    errors = []
-    if sightengine_result.get("error"):
-        errors.append(f"Sightengine: {sightengine_result['error']}")
-    if hive_result.get("error"):
-        errors.append(f"Hive: {hive_result['error']}")
-    
-    if errors:
-        lines.append("")
-        lines.append("⚠️ **Ошибки:**")
-        for error in errors:
-            lines.append(f"  • {error[:150]}")
     
     return "\n".join(lines)
 
 
 @app.post("/analyze-photo")
 async def analyze_photo(request: PhotoRequest):
-    """Analyze photo for AI-generation, quality, and face attributes"""
+    """Analyze photo for AI-generation, filters, quality, and face attributes"""
     try:
         # Validate input
         if not request.photo_url and not request.image_base64:
@@ -464,18 +570,20 @@ async def analyze_photo(request: PhotoRequest):
                 detail="Either photo_url or image_base64 must be provided"
             )
         
-        # Run both analyses
+        # Run all analyses
         sightengine_result = analyze_with_sightengine(request.photo_url, request.image_base64)
         hive_result = analyze_with_hive(request.photo_url, request.image_base64)
+        gpt_result = analyze_with_gpt4_vision(request.photo_url, request.image_base64)
         
         # Format the results
-        formatted_result = format_analysis_result(sightengine_result, hive_result)
+        formatted_result = format_analysis_result(sightengine_result, hive_result, gpt_result)
         
         return {
             "analysis": formatted_result,
             "debug": {
                 "sightengine": sightengine_result,
-                "hive": hive_result
+                "hive": hive_result,
+                "gpt_vision": {k: v for k, v in gpt_result.items() if k != "analysis"}
             }
         }
         
