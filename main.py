@@ -4,8 +4,9 @@ from pydantic import BaseModel
 from openai import OpenAI
 import requests
 import os
-import json
+import base64
 import traceback
+from typing import Optional
 
 app = FastAPI()
 
@@ -38,7 +39,8 @@ class ProfileRequest(BaseModel):
 
 
 class PhotoRequest(BaseModel):
-    photo_url: str
+    photo_url: Optional[str] = None
+    image_base64: Optional[str] = None
 
 
 @app.get("/")
@@ -81,7 +83,22 @@ async def analyze_profile(request: ProfileRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-def analyze_with_sightengine(photo_url: str) -> dict:
+def get_image_bytes(photo_url: Optional[str], image_base64: Optional[str]) -> bytes:
+    """Get image bytes from URL or base64 string"""
+    if image_base64:
+        # Remove data URL prefix if present
+        if ',' in image_base64:
+            image_base64 = image_base64.split(',')[1]
+        return base64.b64decode(image_base64)
+    elif photo_url:
+        response = requests.get(photo_url, timeout=30)
+        response.raise_for_status()
+        return response.content
+    else:
+        raise ValueError("Either photo_url or image_base64 must be provided")
+
+
+def analyze_with_sightengine(photo_url: Optional[str], image_base64: Optional[str]) -> dict:
     """Analyze photo using Sightengine API"""
     result = {
         "ai_generated": None,
@@ -92,27 +109,45 @@ def analyze_with_sightengine(photo_url: str) -> dict:
         "face_angle": None,
         "face_filters": None,
         "sunglasses": None,
-        "error": None,
-        "raw_response": None
+        "error": None
     }
     
     try:
-        # Use multiple models: quality, genai, face-attributes
-        params = {
-            'url': photo_url,
-            'models': 'quality,genai,face-attributes',
-            'api_user': SIGHTENGINE_USER,
-            'api_secret': SIGHTENGINE_SECRET
-        }
-        
-        response = requests.get(
-            'https://api.sightengine.com/1.0/check.json',
-            params=params,
-            timeout=30
-        )
+        if image_base64:
+            # Upload raw binary image
+            image_bytes = get_image_bytes(None, image_base64)
+            
+            files = {
+                'media': ('image.jpg', image_bytes, 'image/jpeg')
+            }
+            data = {
+                'models': 'quality,genai,face-attributes',
+                'api_user': SIGHTENGINE_USER,
+                'api_secret': SIGHTENGINE_SECRET
+            }
+            
+            response = requests.post(
+                'https://api.sightengine.com/1.0/check.json',
+                files=files,
+                data=data,
+                timeout=30
+            )
+        else:
+            # Use URL
+            params = {
+                'url': photo_url,
+                'models': 'quality,genai,face-attributes',
+                'api_user': SIGHTENGINE_USER,
+                'api_secret': SIGHTENGINE_SECRET
+            }
+            
+            response = requests.get(
+                'https://api.sightengine.com/1.0/check.json',
+                params=params,
+                timeout=30
+            )
         
         data = response.json()
-        result["raw_response"] = data
         
         if data.get("status") == "success":
             # Parse quality score (0-1 scale)
@@ -150,38 +185,50 @@ def analyze_with_sightengine(photo_url: str) -> dict:
     return result
 
 
-def analyze_with_hive(photo_url: str) -> dict:
+def analyze_with_hive(photo_url: Optional[str], image_base64: Optional[str]) -> dict:
     """Analyze photo using Hive AI API for AI-generated detection"""
     result = {
         "ai_generated": None,
         "ai_source": None,
-        "error": None,
-        "raw_response": None
+        "error": None
     }
     
     try:
         headers = {
-            "Authorization": f"Token {HIVE_API_KEY}",
-            "Content-Type": "application/json"
+            "Authorization": f"Token {HIVE_API_KEY}"
         }
         
-        payload = {
-            "url": photo_url
-        }
-        
-        response = requests.post(
-            "https://api.thehive.ai/api/v2/task/sync",
-            headers=headers,
-            json=payload,
-            timeout=30
-        )
+        if image_base64:
+            # Upload as multipart form data
+            image_bytes = get_image_bytes(None, image_base64)
+            
+            files = {
+                'media': ('image.jpg', image_bytes, 'image/jpeg')
+            }
+            
+            response = requests.post(
+                "https://api.thehive.ai/api/v2/task/sync",
+                headers=headers,
+                files=files,
+                timeout=30
+            )
+        else:
+            # Use URL
+            headers["Content-Type"] = "application/json"
+            payload = {"url": photo_url}
+            
+            response = requests.post(
+                "https://api.thehive.ai/api/v2/task/sync",
+                headers=headers,
+                json=payload,
+                timeout=30
+            )
         
         data = response.json()
-        result["raw_response"] = data
         
         # Parse Hive AI response
         # Response structure: status[0].response.output[0].classes[]
-        if "status" in data and len(data["status"]) > 0:
+        if "status" in data and isinstance(data["status"], list) and len(data["status"]) > 0:
             status_item = data["status"][0]
             
             if "response" in status_item and "output" in status_item["response"]:
@@ -244,7 +291,7 @@ def analyze_with_hive(photo_url: str) -> dict:
     except requests.exceptions.Timeout:
         result["error"] = "Hive API timeout"
     except Exception as e:
-        result["error"] = f"Hive error: {str(e)}\n{traceback.format_exc()}"
+        result["error"] = f"Hive error: {str(e)}"
     
     return result
 
@@ -410,9 +457,16 @@ def format_analysis_result(sightengine_result: dict, hive_result: dict) -> str:
 async def analyze_photo(request: PhotoRequest):
     """Analyze photo for AI-generation, quality, and face attributes"""
     try:
+        # Validate input
+        if not request.photo_url and not request.image_base64:
+            raise HTTPException(
+                status_code=400, 
+                detail="Either photo_url or image_base64 must be provided"
+            )
+        
         # Run both analyses
-        sightengine_result = analyze_with_sightengine(request.photo_url)
-        hive_result = analyze_with_hive(request.photo_url)
+        sightengine_result = analyze_with_sightengine(request.photo_url, request.image_base64)
+        hive_result = analyze_with_hive(request.photo_url, request.image_base64)
         
         # Format the results
         formatted_result = format_analysis_result(sightengine_result, hive_result)
@@ -425,10 +479,12 @@ async def analyze_photo(request: PhotoRequest):
             }
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500, 
-            detail=f"Error analyzing photo: {str(e)}\n{traceback.format_exc()}"
+            detail=f"Error analyzing photo: {str(e)}"
         )
 
 
